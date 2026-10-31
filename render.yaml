@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: tds-public-incident-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    disk:
+      name: incident-agent-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/incident_agent.db
+      - key: OPENAI_BASE_URL
+        value: https://aipipe.org/openai/v1
+      - key: OPENAI_MODEL
+        value: gpt-5-nano
+      - key: OPENAI_API_KEY
+        sync: false
