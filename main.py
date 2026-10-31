@@ -7,6 +7,8 @@ import hmac
 import hashlib
 import secrets
 import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -19,6 +21,8 @@ load_dotenv("config.env")
 PROFILE = "ga5-incident-agent/v2"
 AGENT_NAME = os.getenv("AGENT_NAME", "incident-response")
 DB_PATH = os.getenv("DATABASE_PATH", "incident_agent.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_PLACEHOLDER = "%s" if DATABASE_URL else "?"
 MODEL_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("MODEL_API_KEY", ""))
 MODEL_BASE_URL = os.getenv("OPENAI_BASE_URL", os.getenv("MODEL_BASE_URL", "https://aipipe.org/openai/v1")).rstrip("/")
 MODEL_NAME = os.getenv("OPENAI_MODEL", os.getenv("MODEL_NAME", "gpt-5-nano"))
@@ -28,6 +32,14 @@ app = FastAPI(title="TDS Public HTTPS Incident Agent", version="2.0.0")
 
 
 def connect():
+    if DATABASE_URL:
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=10,
+            prepare_threshold=None
+        )
+
     c = sqlite3.connect(DB_PATH, timeout=20)
     c.row_factory = sqlite3.Row
     return c
@@ -35,21 +47,25 @@ def connect():
 
 def init_db():
     with connect() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS runs (
-            run_id TEXT PRIMARY KEY,
-            request_hash TEXT NOT NULL,
-            state_json TEXT NOT NULL,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS receipts (
-            run_id TEXT NOT NULL,
-            receipt_id TEXT NOT NULL,
-            receipt_hash TEXT NOT NULL,
-            response_json TEXT NOT NULL,
-            PRIMARY KEY(run_id, receipt_id)
-        )""")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                created_at DOUBLE PRECISION NOT NULL,
+                updated_at DOUBLE PRECISION NOT NULL
+            )
+        """)
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS receipts (
+                run_id TEXT NOT NULL,
+                receipt_id TEXT NOT NULL,
+                receipt_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                PRIMARY KEY (run_id, receipt_id)
+            )
+        """)
 
 init_db()
 
@@ -128,8 +144,8 @@ def save_state(state):
     now = time.time()
     with connect() as c:
         c.execute(
-            """INSERT INTO runs(run_id, request_hash, state_json, created_at, updated_at)
-               VALUES(?,?,?,?,?)
+            f"""INSERT INTO runs(run_id, request_hash, state_json, created_at, updated_at)
+               VALUES({DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER})
                ON CONFLICT(run_id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at""",
             (state["runId"], state["request_hash"], compact_json(state), now, now)
         )
@@ -137,13 +153,13 @@ def save_state(state):
 
 def load_state(run_id):
     with connect() as c:
-        row = c.execute("SELECT state_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        row = c.execute(f"SELECT state_json FROM runs WHERE run_id={DB_PLACEHOLDER}", (run_id,)).fetchone()
     return json.loads(row["state_json"]) if row else None
 
 
 def load_run_row(run_id):
     with connect() as c:
-        return c.execute("SELECT request_hash FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        return c.execute(f"SELECT request_hash FROM runs WHERE run_id={DB_PLACEHOLDER}", (run_id,)).fetchone()
 
 
 def public_state(state):
@@ -551,7 +567,7 @@ async def receive_receipt(run_id: str, request: Request):
 
     with connect() as c:
         old = c.execute(
-            "SELECT receipt_hash,response_json FROM receipts WHERE run_id=? AND receipt_id=?",
+            f"SELECT receipt_hash,response_json FROM receipts WHERE run_id={DB_PLACEHOLDER} AND receipt_id={DB_PLACEHOLDER}",
             (run_id, receipt_id)
         ).fetchone()
     if old:
@@ -722,7 +738,7 @@ async def receive_receipt(run_id: str, request: Request):
     response = public_state(state)
     with connect() as c:
         c.execute(
-            "INSERT INTO receipts(run_id,receipt_id,receipt_hash,response_json) VALUES(?,?,?,?)",
+            f"INSERT INTO receipts(run_id,receipt_id,receipt_hash,response_json) VALUES({DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER})",
             (run_id, receipt_id, receipt_hash, compact_json(response))
         )
     return JSONResponse(response)
