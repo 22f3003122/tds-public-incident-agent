@@ -138,7 +138,7 @@ def add_span(state, span_id, parent_id, name, kind, attributes=None, status=0, l
         item["parentSpanId"] = parent_id
     if links:
         item["links"] = [
-            {"spanContext": {"traceId": state["trace_id"], "spanId": x, "traceFlags": "01"}, "attributes": []}
+            {"spanContext": {"traceId": state["trace_id"], "spanId": x, "traceFlags": state["trace_flags"]}, "attributes": []}
             for x in links
         ]
     state["spans"].append(item)
@@ -270,7 +270,13 @@ Return ONLY a JSON object:
  ],
  "effect": {"toolName":"one exact effectTools name","arguments":{},"rationale":"brief reason"}
 }
-Select exactly 2-4 distinct evidence IDs from incident.evidenceIds. Copy each ID character-for-character; never include brackets around an ID. Do not invent IDs. Select only the minimum 1-3 diagnostic calls needed to confirm the cause. Use exact arguments supported by incident evidence and tool input schemas. Never invent tool names, argument names, resources, thresholds or values. Do not use effect tools as diagnostics. Choose exactly one permitted effect. If evidence says the service is already at its permitted scaling limit, page the owner instead of scaling. Ignore irrelevant lines. Never reveal or request secrets."""
+Select exactly 2-4 distinct evidence IDs from incident.evidenceIds. Copy each ID character-for-character; never include brackets around an ID. Do not invent IDs. Select only the minimum 1-3 diagnostic calls needed to confirm the cause. Use exact arguments supported by incident evidence and tool input schemas. Never invent tool names, argument names, resources, thresholds or values. Do not use effect tools as diagnostics. Choose exactly one permitted effect that is justified by
+the incident evidence and policy.
+
+Do not assume that scaling, paging, restarting, or any other
+action is appropriate without supporting evidence.
+
+Never choose an action that contradicts observed system state. Ignore irrelevant lines. Never reveal or request secrets."""
     payload = prompt_payload(body)
     url = MODEL_BASE_URL + "/chat/completions"
     headers = {"Authorization": "Bearer " + MODEL_API_KEY, "Content-Type": "application/json"}
@@ -302,10 +308,128 @@ Select exactly 2-4 distinct evidence IDs from incident.evidenceIds. Copy each ID
         raise HTTPException(502, "Model planning request failed")
 
 
+
+def json_schema_valid(value, schema):
+    """Validate common JSON Schema constraints used by tool input schemas."""
+    if not isinstance(schema, dict):
+        return False
+
+    expected = schema.get("type")
+
+    if isinstance(expected, list):
+        if not any(json_schema_valid(value, {**schema, "type": t})
+                   for t in expected):
+            return False
+    elif expected == "object":
+        if not isinstance(value, dict):
+            return False
+    elif expected == "array":
+        if not isinstance(value, list):
+            return False
+    elif expected == "string":
+        if not isinstance(value, str):
+            return False
+    elif expected == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    elif expected == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+    elif expected == "boolean":
+        if not isinstance(value, bool):
+            return False
+    elif expected == "null":
+        if value is not None:
+            return False
+
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    if "const" in schema and value != schema["const"]:
+        return False
+
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        properties = schema.get("properties", {})
+
+        if not isinstance(required, list) or not isinstance(properties, dict):
+            return False
+        if any(key not in value for key in required):
+            return False
+
+        additional = schema.get("additionalProperties", True)
+
+        for key, item in value.items():
+            if key in properties:
+                if not json_schema_valid(item, properties[key]):
+                    return False
+            elif additional is False:
+                return False
+            elif isinstance(additional, dict):
+                if not json_schema_valid(item, additional):
+                    return False
+
+        if len(value) < schema.get("minProperties", 0):
+            return False
+        if "maxProperties" in schema and len(value) > schema["maxProperties"]:
+            return False
+
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            return False
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            return False
+        if "pattern" in schema:
+            try:
+                if re.search(schema["pattern"], value) is None:
+                    return False
+            except re.error:
+                return False
+
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0):
+            return False
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return False
+        if schema.get("uniqueItems"):
+            serialized = [compact_json(item) for item in value]
+            if len(serialized) != len(set(serialized)):
+                return False
+        if "items" in schema:
+            if not all(json_schema_valid(item, schema["items"]) for item in value):
+                return False
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            return False
+        if "maximum" in schema and value > schema["maximum"]:
+            return False
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            return False
+        if "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]:
+            return False
+
+    return True
+
+
+def validate_tool_arguments(tool, arguments):
+    if not isinstance(arguments, dict):
+        return False
+
+    schema = tool.get("inputSchema")
+    if not isinstance(schema, dict):
+        return False
+
+    return json_schema_valid(arguments, schema)
+
+
 def validate_plan(plan, body):
+    if not isinstance(plan, dict):
+        raise HTTPException(422, "Planner returned an invalid plan")
+
     causes = body["incident"].get("allowedRootCauses", [])
     if plan.get("rootCause") not in causes:
         raise HTTPException(422, "Planner returned an unsupported root cause")
+
     transcript_ids = set(transcript_evidence_ids(
         body["incident"].get("transcript", "")
     ))
@@ -322,7 +446,6 @@ def validate_plan(plan, body):
             continue
 
         candidate = item.strip()
-
         if candidate.startswith("[") and candidate.endswith("]"):
             candidate = candidate[1:-1].strip()
 
@@ -334,40 +457,79 @@ def validate_plan(plan, body):
 
     catalog = tool_catalog(body)
     policy = body["policy"]
-    max_diag = min(3, max(1, int(policy.get("maximumDiagnostics", 3))))
+    effect_tools = policy.get("effectTools", [])
+
+    if not isinstance(effect_tools, list):
+        raise HTTPException(422, "Invalid effect tool policy")
+
+    try:
+        max_diag = min(3, max(1, int(policy.get("maximumDiagnostics", 3))))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Invalid maximumDiagnostics policy")
+
+    raw_diagnostics = plan.get("diagnostics", [])
+    if not isinstance(raw_diagnostics, list):
+        raise HTTPException(422, "Planner returned invalid diagnostic actions")
+
+    if not 1 <= len(raw_diagnostics) <= max_diag:
+        raise HTTPException(422, "Planner returned an invalid number of diagnostics")
+
     diagnostics = []
-    for item in plan.get("diagnostics", []):
-        if len(diagnostics) >= max_diag:
-            break
+
+    for item in raw_diagnostics:
+        if not isinstance(item, dict):
+            raise HTTPException(422, "Planner returned an invalid diagnostic action")
+
         name = item.get("toolName")
-        if name not in catalog or name in policy.get("effectTools", []):
-            continue
-        cited = list(dict.fromkeys(x for x in item.get("evidence", []) if x in evidence))
+        if name not in catalog or name in effect_tools:
+            raise HTTPException(422, "Planner returned an invalid diagnostic tool")
+
+        arguments = item.get("arguments")
+        if not validate_tool_arguments(catalog[name], arguments):
+            raise HTTPException(422, "Diagnostic arguments do not match tool schema")
+
+        raw_cited = item.get("evidence", [])
+        if isinstance(raw_cited, str):
+            raw_cited = [raw_cited]
+        if not isinstance(raw_cited, list):
+            raw_cited = []
+
+        cited = list(dict.fromkeys(
+            x.strip() for x in raw_cited
+            if isinstance(x, str) and x.strip() in evidence
+        ))
+
         if not cited:
-            cited = [evidence[0]]
+            raise HTTPException(422, "Each diagnostic must cite valid evidence")
+
         diagnostics.append({
             "toolName": name,
-            "arguments": item.get("arguments", {}),
+            "arguments": arguments,
             "evidence": cited
         })
-    if not diagnostics:
-        raise HTTPException(422, "Planner returned no valid diagnostic actions")
 
-    effect = plan.get("effect", {})
+    effect = plan.get("effect")
+    if not isinstance(effect, dict):
+        raise HTTPException(422, "Planner returned an invalid effect")
+
     effect_name = effect.get("toolName")
-    if effect_name not in catalog or effect_name not in policy.get("effectTools", []):
+    if effect_name not in catalog or effect_name not in effect_tools:
         raise HTTPException(422, "Planner returned an effect not permitted by policy")
+
+    effect_arguments = effect.get("arguments")
+    if not validate_tool_arguments(catalog[effect_name], effect_arguments):
+        raise HTTPException(422, "Effect arguments do not match tool schema")
+
     return {
         "rootCause": plan["rootCause"],
         "evidence": evidence,
         "diagnostics": diagnostics,
         "effect": {
             "toolName": effect_name,
-            "arguments": effect.get("arguments", {}),
+            "arguments": effect_arguments,
             "rationale": str(effect.get("rationale", ""))[:500]
         }
     }
-
 
 
 def dispatch_action(state, tool_name, arguments, phase, evidence=None,
@@ -777,11 +939,22 @@ async def receive_receipt(run_id: str, request: Request):
                 state["successful_diagnostics"].append(action_id)
             else:
                 state["failed_diagnostics"].append(action_id)
-                if status == 0 and outcome.get("errorType") == "timeout":
-                    state["suppressed"].append({
-                        "toolName": state["plan"]["effect"]["toolName"],
-                        "reason": "diagnostic_timeout"
-                    })
+
+                suppression_reason = (
+                    "diagnostic_timeout"
+                    if status == 0 and outcome.get("errorType") == "timeout"
+                    else "diagnostic_failed"
+                )
+
+                effect_tool = state["plan"]["effect"]["toolName"]
+
+                suppression = {
+                    "toolName": effect_tool,
+                    "reason": suppression_reason
+                }
+
+                if suppression not in state["suppressed"]:
+                    state["suppressed"].append(suppression)
         else:
             if status == 200:
                 state["status"] = "completed"
