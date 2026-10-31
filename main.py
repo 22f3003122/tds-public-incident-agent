@@ -734,13 +734,29 @@ async def receive_receipt(run_id: str, request: Request):
         if state["pending"]:
             state["status"] = "waiting"
 
-    save_state(state)
+
     response = public_state(state)
+    now = time.time()
+
     with connect() as c:
+        cur = c.execute(
+            f"""UPDATE runs
+                SET state_json={DB_PLACEHOLDER},
+                    updated_at={DB_PLACEHOLDER}
+                WHERE run_id={DB_PLACEHOLDER}""",
+            (compact_json(state), now, run_id)
+        )
+
+        if cur.rowcount != 1:
+            raise HTTPException(404, "Incident run not found")
+
         c.execute(
-            f"INSERT INTO receipts(run_id,receipt_id,receipt_hash,response_json) VALUES({DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER})",
+            f"""INSERT INTO receipts
+                (run_id, receipt_id, receipt_hash, response_json)
+                VALUES ({DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER},{DB_PLACEHOLDER})""",
             (run_id, receipt_id, receipt_hash, compact_json(response))
         )
+
     return JSONResponse(response)
 
 
