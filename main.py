@@ -29,6 +29,22 @@ MODEL_NAME = os.getenv("OPENAI_MODEL", os.getenv("MODEL_NAME", "gpt-5-nano"))
 MODEL_TIMEOUT = float(os.getenv("MODEL_TIMEOUT", "13"))
 
 app = FastAPI(title="TDS Public HTTPS Incident Agent", version="2.0.0")
+@app.exception_handler(HTTPException)
+async def log_http_exception(request: Request, exc: HTTPException):
+    # Log only the route, status and fixed validation reason.
+    # Never log request bodies, headers, transcripts or credentials.
+    print(
+        f"HTTP rejection: method={request.method} "
+        f"path={request.url.path} "
+        f"status={exc.status_code} "
+        f"reason={exc.detail}",
+        flush=True
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers
+    )
 
 
 def connect():
