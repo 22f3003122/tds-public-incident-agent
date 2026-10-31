@@ -206,7 +206,6 @@ Select only the minimum 1-3 diagnostic calls needed to confirm the cause. Use ex
     headers = {"Authorization": "Bearer " + MODEL_API_KEY, "Content-Type": "application/json"}
     data = {
         "model": MODEL_NAME,
-        "temperature": 0,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system},
