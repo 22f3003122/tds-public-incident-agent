@@ -206,6 +206,7 @@ Select only the minimum 1-3 diagnostic calls needed to confirm the cause. Use ex
     headers = {"Authorization": "Bearer " + MODEL_API_KEY, "Content-Type": "application/json"}
     data = {
         "model": MODEL_NAME,
+        "reasoning_effort": "minimal",
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system},
@@ -220,7 +221,14 @@ Select only the minimum 1-3 diagnostic calls needed to confirm the cause. Use ex
             return json.loads(raw)
     except HTTPException:
         raise
-    except Exception:
+    except httpx.TimeoutException:
+        print("Planner diagnostic: AI Pipe request timed out")
+        raise HTTPException(502, "Model planning request timed out")
+    except httpx.HTTPStatusError as exc:
+        print(f"Planner diagnostic: AI Pipe HTTP status {exc.response.status_code}")
+        raise HTTPException(502, "Model planning request failed")
+    except Exception as exc:
+        print(f"Planner diagnostic: {type(exc).__name__}")
         raise HTTPException(502, "Model planning request failed")
 
 
@@ -273,12 +281,41 @@ def validate_plan(plan, body):
     }
 
 
+
 def dispatch_action(state, tool_name, arguments, phase, evidence=None,
                     approval=None, reserved_action_id=None, logical=None):
     action_id = reserved_action_id or ("act_" + uuid.uuid4().hex)
     call_id = logical or ("call_" + uuid.uuid4().hex)
     client_id = hx(8)
     attempt = 1
+
+    internal_id = hx(8)
+    common = {
+        "ga5.run.id": state["runId"],
+        "ga5.public.marker": state["public_marker"]
+    }
+
+    # INTERNAL span: logical tool execution
+    add_span(state, internal_id, state["agent_span_id"],
+             "execute_tool " + tool_name, 1, {
+        **common,
+        "ga5.action.id": action_id,
+        "gen_ai.tool.name": tool_name,
+        "gen_ai.tool.call.id": call_id,
+        "gen_ai.operation.name": "execute_tool"
+    })
+
+    # CLIENT span: create it before returning the dispatch.
+    # Its span ID is the one referenced by traceparent.
+    add_span(state, client_id, internal_id,
+             "POST tool/" + tool_name, 3, {
+        **common,
+        "ga5.action.id": action_id,
+        "ga5.attempt": attempt,
+        "http.request.method": "POST",
+        "http.request.resend_count": 0
+    })
+
     dispatch = {
         "actionId": action_id,
         "callId": call_id,
@@ -287,35 +324,40 @@ def dispatch_action(state, tool_name, arguments, phase, evidence=None,
         "arguments": arguments,
         "evidence": evidence or [],
         "attempt": attempt,
-        "traceparent": f"00-{state['trace_id']}-{client_id}-{state['trace_flags']}"
+        "traceparent": (
+            f"00-{state['trace_id']}-{client_id}-{state['trace_flags']}"
+        )
     }
+
     if state.get("tracestate"):
         dispatch["tracestate"] = state["tracestate"]
+
     if approval:
         dispatch["approvalId"] = approval["approvalId"]
         dispatch["approvalNonce"] = approval["nonce"]
 
-    internal_id = hx(8)
-    common = {"ga5.run.id": state["runId"], "ga5.public.marker": state["public_marker"]}
-    add_span(state, internal_id, state["agent_span_id"], "execute_tool " + tool_name, 1, {
-        **common,
-        "ga5.action.id": action_id,
-        "gen_ai.tool.name": tool_name,
-        "gen_ai.tool.call.id": call_id,
-        "gen_ai.operation.name": "execute_tool"
-    })
     state["pending"][action_id] = {
-        "actionId": action_id, "callId": call_id, "toolName": tool_name,
-        "arguments": arguments, "phase": phase, "evidence": evidence or [],
-        "attempt": attempt, "client_span_id": client_id, "internal_span_id": internal_id,
+        "actionId": action_id,
+        "callId": call_id,
+        "toolName": tool_name,
+        "arguments": arguments,
+        "phase": phase,
+        "evidence": evidence or [],
+        "attempt": attempt,
+        "client_span_id": client_id,
+        "internal_span_id": internal_id,
         "approval": approval
     }
+
     state["actionLog"].append(dispatch)
     return dispatch
 
 
+
+
 def record_client_attempt(state, pending, outcome, receipt_id):
     status_code = outcome.get("status", 0)
+
     attrs = {
         "ga5.run.id": state["runId"],
         "ga5.public.marker": state["public_marker"],
@@ -327,12 +369,39 @@ def record_client_attempt(state, pending, outcome, receipt_id):
         "http.request.resend_count": pending["attempt"] - 1,
         "http.response.status_code": status_code
     }
+
     span_status = 0
-    if status_code != 200 or outcome.get("errorType"):
+
+    if status_code == 503:
         span_status = 2
-        attrs["error.type"] = outcome.get("errorType", str(status_code))
-    add_span(state, pending["client_span_id"], pending["internal_span_id"],
-             "POST tool/" + pending["toolName"], 3, attrs, span_status)
+        attrs["error.type"] = "503"
+    elif status_code == 0 and outcome.get("errorType") == "timeout":
+        span_status = 2
+        attrs["error.type"] = "timeout"
+    elif status_code != 200:
+        span_status = 2
+        attrs["error.type"] = outcome.get("errorType") or str(status_code)
+    elif outcome.get("errorType"):
+        span_status = 2
+        attrs["error.type"] = outcome["errorType"]
+
+    # Update the CLIENT span created during dispatch.
+    client_span = next(
+        (
+            span for span in state["spans"]
+            if span["spanId"] == pending["client_span_id"]
+        ),
+        None
+    )
+
+    if client_span is None:
+        raise ValueError("CLIENT span missing for dispatched action")
+
+    client_span["attributes"] = [
+        otlp_attr(key, value) for key, value in attrs.items()
+    ]
+    client_span["status"] = {"code": span_status}
+    client_span["endTimeUnixNano"] = str(time.time_ns())
 
 
 def start_effect_or_approval(state):
@@ -348,6 +417,9 @@ def start_effect_or_approval(state):
             "argumentsDigest": digest(effect["arguments"]),
             "arguments": effect["arguments"]
         }
+        approval_span_id = hx(8)
+        approval["approvalSpanId"] = approval_span_id
+
         state["pending_approval"] = approval
         state["approvals"] = [{
             "approvalId": approval_id,
@@ -355,11 +427,20 @@ def start_effect_or_approval(state):
             "toolName": effect["toolName"],
             "argumentsDigest": approval["argumentsDigest"]
         }]
-        add_span(state, hx(8), state["agent_span_id"], "approval_gate", 1, {
-            "ga5.run.id": state["runId"],
-            "ga5.public.marker": state["public_marker"],
-            "ga5.approval.id": approval_id
-        })
+
+        add_span(
+            state,
+            approval_span_id,
+            state["agent_span_id"],
+            "approval_gate",
+            1,
+            {
+                "ga5.run.id": state["runId"],
+                "ga5.public.marker": state["public_marker"],
+                "ga5.approval.id": approval_id
+            }
+        )
+
         state["dispatches"] = []
         state["status"] = "waiting"
     else:
@@ -490,12 +571,28 @@ async def receive_receipt(run_id: str, request: Request):
             raise HTTPException(422, "Unexpected approval count")
         approval_receipt = approvals[0]
         pending_approval = state.get("pending_approval")
+
         if (not pending_approval or
             approval_receipt.get("approvalId") != pending_approval["approvalId"] or
             approval_receipt.get("decision") != "approved" or
             not isinstance(approval_receipt.get("nonce"), str) or
             not approval_receipt["nonce"]):
             raise HTTPException(422, "Approval does not match pending request")
+
+        approval_span = next(
+            (
+                span for span in state["spans"]
+                if span["spanId"] == pending_approval["approvalSpanId"]
+            ),
+            None
+        )
+
+        if approval_span is None:
+            raise HTTPException(500, "Approval trace span missing")
+
+        approval_span["attributes"].append(
+            otlp_attr("ga5.approval.nonce", approval_receipt["nonce"])
+        )
         state["receiptLog"].append({
             "receiptId": receipt_id,
             "approvalId": approval_receipt["approvalId"],
@@ -539,10 +636,34 @@ async def receive_receipt(run_id: str, request: Request):
         status = outcome["status"]
         if status == 503 and pending["attempt"] == 1:
             # One retry only: same actionId/callId, increment attempt, new CLIENT span ID.
+
             pending["attempt"] = 2
             pending["client_span_id"] = hx(8)
+
+            # Create a new CLIENT span for retry attempt 2.
+            # It uses the same logical INTERNAL span as its parent.
+            retry_common = {
+                "ga5.run.id": state["runId"],
+                "ga5.public.marker": state["public_marker"],
+                "ga5.action.id": pending["actionId"],
+                "ga5.attempt": 2,
+                "http.request.method": "POST",
+                "http.request.resend_count": 1
+            }
+
+            add_span(
+                state,
+                pending["client_span_id"],
+                pending["internal_span_id"],
+                "POST tool/" + pending["toolName"],
+                3,
+                retry_common
+            )
+
             state["pending"][action_id] = pending
+
             retry = {
+
                 "actionId": pending["actionId"],
                 "callId": pending["callId"],
                 "phase": pending["phase"],
