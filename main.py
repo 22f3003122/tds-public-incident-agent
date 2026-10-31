@@ -694,7 +694,13 @@ def start_effect_or_approval(state):
         state["dispatches"] = []
         state["status"] = "waiting"
     else:
-        d = dispatch_action(state, effect["toolName"], effect["arguments"], "effect")
+        d = dispatch_action(
+            state,
+            effect["toolName"],
+            effect["arguments"],
+            "effect",
+            evidence=state["plan"].get("evidence", [])
+        )
         state["effect_action_id"] = d["actionId"]
         state["dispatches"] = [d]
         state["approvals"] = []
@@ -854,6 +860,7 @@ async def receive_receipt(run_id: str, request: Request):
         state["approvals"] = []
         d = dispatch_action(
             state, approved["toolName"], approved["arguments"], "effect",
+            evidence=state["plan"].get("evidence", []),
             approval={"approvalId": approved["approvalId"], "nonce": approval_receipt["nonce"]},
             reserved_action_id=approved["actionId"]
         )
